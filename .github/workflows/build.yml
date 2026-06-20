@@ -2,10 +2,9 @@ name: Build naivecdn
 on:
   push:
     branches: [master]
-    paths:
-      - 'go/**'
   release:
     types: [published]
+  workflow_dispatch:
 defaults:
   run:
     shell: bash
