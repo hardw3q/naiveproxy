@@ -16,10 +16,12 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,6 +42,9 @@ type Config struct {
 	// TLSFingerprint selects the utls ClientHello preset.
 	// Supported: "chrome_auto" (default), "chrome_120", "firefox_120".
 	TLSFingerprint string
+
+	// InsecureSkipVerify disables server certificate verification (for testing only).
+	InsecureSkipVerify bool
 }
 
 func chooseFingerprint(preset string) utls.ClientHelloID {
@@ -59,7 +64,7 @@ func newSessionID() string {
 	return hex.EncodeToString(b)
 }
 
-func dialUTLS(ctx context.Context, cfg Config) (net.Conn, error) {
+func dialTLS(ctx context.Context, cfg Config) (net.Conn, error) {
 	u, err := url.Parse(cfg.ProxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse proxy URL: %w", err)
@@ -73,12 +78,24 @@ func dialUTLS(ctx context.Context, cfg Config) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
 	}
-	uconn := utls.UClient(rawConn, &utls.Config{ServerName: host}, chooseFingerprint(cfg.TLSFingerprint))
-	if err := uconn.HandshakeContext(ctx); err != nil {
+	log.Printf("[debug] TCP connected to %s", net.JoinHostPort(host, port))
+
+	// For CDN-mediated connections the TLS fingerprint is invisible (CDN terminates TLS),
+	// so use standard crypto/tls which correctly honours NextProtos. utls Chrome preset
+	// overrides NextProtos and would negotiate h2, breaking our raw HTTP/1.1 framing.
+	tlsCfg := &tls.Config{
+		ServerName:         host,
+		NextProtos:         []string{"http/1.1"},
+		Renegotiation:      tls.RenegotiateFreelyAsClient,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
+	}
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 		return nil, fmt.Errorf("TLS handshake: %w", err)
 	}
-	return uconn, nil
+	log.Printf("[debug] TLS handshake OK, ALPN=%s", tlsConn.ConnectionState().NegotiatedProtocol)
+	return tlsConn, nil
 }
 
 func buildAuthHeader(cfg Config) string {
@@ -143,7 +160,7 @@ func Stream(ctx context.Context, cfg Config, target string, appConn net.Conn) er
 // connectDown opens a GET /tunnel request and returns when the server sends 200 OK.
 // The caller reads downResp.Body to receive downstream data.
 func connectDown(ctx context.Context, cfg Config, host, path, auth, target, sessionID string) (net.Conn, *http.Response, error) {
-	conn, err := dialUTLS(ctx, cfg)
+	conn, err := dialTLS(ctx, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -160,6 +177,8 @@ func connectDown(ctx context.Context, cfg Config, host, path, auth, target, sess
 	sb.WriteString("\r\nContent-Type: application/octet-stream\r\n")
 	if auth != "" {
 		sb.WriteString("Proxy-Authorization: ")
+		sb.WriteString(auth)
+		sb.WriteString("\r\nX-Naive-Auth: ")
 		sb.WriteString(auth)
 		sb.WriteString("\r\n")
 	}
@@ -217,7 +236,7 @@ func postChunk(ctx context.Context, cfg Config, host, path, auth, sessionID stri
 	// Try with existing connection first; on any error open a new one.
 	for attempt := 0; attempt < 2; attempt++ {
 		if *upConn == nil {
-			c, err := dialUTLS(ctx, cfg)
+			c, err := dialTLS(ctx, cfg)
 			if err != nil {
 				return err
 			}
@@ -248,6 +267,8 @@ func doPost(host, path, auth, sessionID string, data []byte, conn net.Conn) erro
 	sb.WriteString(fmt.Sprintf("\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n", len(data)))
 	if auth != "" {
 		sb.WriteString("Proxy-Authorization: ")
+		sb.WriteString(auth)
+		sb.WriteString("\r\nX-Naive-Auth: ")
 		sb.WriteString(auth)
 		sb.WriteString("\r\n")
 	}
