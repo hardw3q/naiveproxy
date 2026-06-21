@@ -1,15 +1,15 @@
-// Package tunnel implements the CDN-compatible split tunnel transport.
+// Package tunnel implements the CDN-compatible Meek-style tunnel transport.
 //
-// Protocol (two connections, works despite CDN request-body buffering):
+// Protocol:
 //
-//	GET /tunnel  X-Naive-Session:ID X-Naive-Target:host:port
-//	  → server dials target, streams target→client in response body (CDNs never buffer responses)
+//	POST /tunnel  X-Naive-Session:ID  X-Naive-Target:host:port (first POST only)
+//	  body    = upstream data (may be empty)
+//	  200 OK  body = downstream data (target responded within poll timeout)
+//	  204     body empty (no downstream data this poll, try again)
+//	  410     target closed connection
 //
-//	POST /tunnel X-Naive-Session:ID  body=chunk
-//	  → server writes chunk to target (small complete body, CDN buffers quickly, then forwards)
-//
-// Upstream (client→server) sends sequential chunks; each POST waits for 200 OK
-// before the next. Downstream (server→client) is continuous streaming via GET response.
+// Each POST is a complete request/response cycle. CDNs that buffer streaming
+// GET responses handle these correctly because each response is short and closed.
 package tunnel
 
 import (
@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,36 +27,16 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-
-	utls "github.com/refraction-networking/utls"
+	"sync"
+	"time"
 )
 
 // Config holds the proxy connection parameters.
 type Config struct {
-	// ProxyURL is the full HTTPS URL of the proxy, including credentials.
-	// Example: "https://user:pass@cdn.example.com"
-	ProxyURL string
-
-	// TunnelPath is the endpoint path. Defaults to "/tunnel".
-	TunnelPath string
-
-	// TLSFingerprint selects the utls ClientHello preset.
-	// Supported: "chrome_auto" (default), "chrome_120", "firefox_120".
-	TLSFingerprint string
-
-	// InsecureSkipVerify disables server certificate verification (for testing only).
+	ProxyURL           string
+	TunnelPath         string
+	TLSFingerprint     string // unused, kept for config compat
 	InsecureSkipVerify bool
-}
-
-func chooseFingerprint(preset string) utls.ClientHelloID {
-	switch strings.ToLower(preset) {
-	case "chrome_120":
-		return utls.HelloChrome_120
-	case "firefox_120":
-		return utls.HelloFirefox_120
-	default:
-		return utls.HelloChrome_Auto
-	}
 }
 
 func newSessionID() string {
@@ -78,15 +59,9 @@ func dialTLS(ctx context.Context, cfg Config) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
 	}
-	log.Printf("[debug] TCP connected to %s", net.JoinHostPort(host, port))
-
-	// For CDN-mediated connections the TLS fingerprint is invisible (CDN terminates TLS),
-	// so use standard crypto/tls which correctly honours NextProtos. utls Chrome preset
-	// overrides NextProtos and would negotiate h2, breaking our raw HTTP/1.1 framing.
 	tlsCfg := &tls.Config{
 		ServerName:         host,
 		NextProtos:         []string{"http/1.1"},
-		Renegotiation:      tls.RenegotiateFreelyAsClient,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	}
 	tlsConn := tls.Client(rawConn, tlsCfg)
@@ -94,7 +69,7 @@ func dialTLS(ctx context.Context, cfg Config) (net.Conn, error) {
 		rawConn.Close()
 		return nil, fmt.Errorf("TLS handshake: %w", err)
 	}
-	log.Printf("[debug] TLS handshake OK, ALPN=%s", tlsConn.ConnectionState().NegotiatedProtocol)
+	log.Printf("[tunnel] connected %s ALPN=%s", net.JoinHostPort(host, port), tlsConn.ConnectionState().NegotiatedProtocol)
 	return tlsConn, nil
 }
 
@@ -123,8 +98,13 @@ func proxyHost(cfg Config) string {
 	return u.Host
 }
 
-// Stream establishes a split POST/GET tunnel to the proxy and copies data
-// bidirectionally between appConn and the remote target.
+// isTimeout returns true if err is a network deadline/timeout error.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// Stream establishes a Meek-style tunnel and copies data bidirectionally.
 func Stream(ctx context.Context, cfg Config, target string, appConn net.Conn) error {
 	sessionID := newSessionID()
 	auth := buildAuthHeader(cfg)
@@ -134,129 +114,120 @@ func Stream(ctx context.Context, cfg Config, target string, appConn net.Conn) er
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// — Downstream: GET /tunnel → server streams target→client in response body.
-	downConn, downResp, err := connectDown(ctx, cfg, host, path, auth, target, sessionID)
-	if err != nil {
-		return fmt.Errorf("tunnel down: %w", err)
-	}
-	defer downConn.Close()
-	defer downResp.Body.Close()
+	// upCh buffers upstream chunks from the app (non-blocking producer).
+	upCh := make(chan []byte, 32)
 
-	if downResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("proxy GET returned %d", downResp.StatusCode)
-	}
-
-	// — Upstream: read from appConn, POST chunks to server.
+	// Reader goroutine: continuously drain appConn into upCh.
 	go func() {
 		defer cancel()
-		sendUpstream(ctx, cfg, host, path, auth, sessionID, appConn)
-	}()
-
-	// Copy server response (downstream) → appConn.
-	io.Copy(appConn, downResp.Body) //nolint:errcheck
-	return nil
-}
-
-// connectDown opens a GET /tunnel request and returns when the server sends 200 OK.
-// The caller reads downResp.Body to receive downstream data.
-func connectDown(ctx context.Context, cfg Config, host, path, auth, target, sessionID string) (net.Conn, *http.Response, error) {
-	conn, err := dialTLS(ctx, cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var sb strings.Builder
-	sb.WriteString("GET ")
-	sb.WriteString(path)
-	sb.WriteString(" HTTP/1.1\r\nHost: ")
-	sb.WriteString(host)
-	sb.WriteString("\r\nX-Naive-Target: ")
-	sb.WriteString(target)
-	sb.WriteString("\r\nX-Naive-Session: ")
-	sb.WriteString(sessionID)
-	sb.WriteString("\r\nContent-Type: application/octet-stream\r\n")
-	if auth != "" {
-		sb.WriteString("Proxy-Authorization: ")
-		sb.WriteString(auth)
-		sb.WriteString("\r\nX-Naive-Auth: ")
-		sb.WriteString(auth)
-		sb.WriteString("\r\n")
-	}
-	sb.WriteString("\r\n")
-
-	if _, err := io.WriteString(conn, sb.String()); err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("write GET headers: %w", err)
-	}
-
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("read GET response: %w", err)
-	}
-	return conn, resp, nil
-}
-
-// sendUpstream reads data from appConn and POSTs each chunk to the server.
-// Runs until context is cancelled or an error occurs.
-func sendUpstream(ctx context.Context, cfg Config, host, path, auth, sessionID string, appConn net.Conn) {
-	buf := make([]byte, 16*1024)
-	var upConn net.Conn
-
-	defer func() {
-		if upConn != nil {
-			upConn.Close()
-		}
-	}()
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		n, err := appConn.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-
-			if perr := postChunk(ctx, cfg, host, path, auth, sessionID, chunk, &upConn); perr != nil {
+		buf := make([]byte, 16*1024)
+		for {
+			n, err := appConn.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				select {
+				case upCh <- chunk:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
 				return
 			}
 		}
-		if err != nil {
-			return
-		}
+	}()
+
+	isFirst := true
+
+	// Give the app a moment to send initial data before the first POST.
+	// This avoids creating an empty-body first POST that wastes a poll cycle.
+	var initData []byte
+	select {
+	case chunk := <-upCh:
+		initData = chunk
+	case <-time.After(100 * time.Millisecond):
+		// no initial data; first POST will create the session with empty body
+	case <-ctx.Done():
+		return nil
 	}
-}
 
-// postChunk sends one upstream chunk as a POST request with Content-Length.
-// Reuses upConn across calls (keep-alive); reopens on error.
-func postChunk(ctx context.Context, cfg Config, host, path, auth, sessionID string, data []byte, upConn *net.Conn) error {
-	// Try with existing connection first; on any error open a new one.
-	for attempt := 0; attempt < 2; attempt++ {
-		if *upConn == nil {
-			c, err := dialTLS(ctx, cfg)
-			if err != nil {
-				return err
-			}
-			*upConn = c
+	conn, err := dialTLS(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	var mu sync.Mutex // protect conn
+
+	// Poll loop: each iteration sends one POST and writes downstream to appConn.
+	for {
+		if ctx.Err() != nil {
+			mu.Lock()
+			conn.Close()
+			mu.Unlock()
+			return nil
 		}
 
-		if err := doPost(host, path, auth, sessionID, data, *upConn); err != nil {
-			(*upConn).Close()
-			*upConn = nil
-			if attempt == 1 {
+		// Collect all pending upstream data (non-blocking drain of upCh).
+		upData := initData
+		initData = nil
+	drain:
+		for {
+			select {
+			case chunk := <-upCh:
+				upData = append(upData, chunk...)
+			default:
+				break drain
+			}
+		}
+
+		down, closed, err := meekPost(ctx, cfg, host, path, auth, sessionID, target, upData, isFirst, conn)
+		isFirst = false
+
+		if err != nil {
+			log.Printf("[tunnel] reconnect: %v", err)
+			mu.Lock()
+			conn.Close()
+			mu.Unlock()
+			// Reconnect the CDN TLS connection; server session stays alive.
+			conn, err = dialTLS(ctx, cfg)
+			if err != nil {
 				return err
 			}
 			continue
 		}
-		return nil
+
+		if len(down) > 0 {
+			if _, werr := appConn.Write(down); werr != nil {
+				conn.Close()
+				return nil
+			}
+			log.Printf("[tunnel] downstream %d bytes", len(down))
+		}
+
+		if closed {
+			log.Printf("[tunnel] session closed by target")
+			conn.Close()
+			return nil
+		}
+
+		// If no data in either direction, add a small back-off to avoid tight loop.
+		if len(down) == 0 && len(upData) == 0 {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+				return nil
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
 	}
-	return nil
 }
 
-func doPost(host, path, auth, sessionID string, data []byte, conn net.Conn) error {
+// meekPost sends one POST /tunnel using an existing persistent TLS conn.
+// The caller must not use conn concurrently.
+func meekPost(ctx context.Context, cfg Config, host, path, auth, sessionID, target string, upData []byte, isFirst bool, conn net.Conn) (down []byte, closed bool, err error) {
+	_ = cfg // reserved
+
 	var sb strings.Builder
 	sb.WriteString("POST ")
 	sb.WriteString(path)
@@ -264,7 +235,11 @@ func doPost(host, path, auth, sessionID string, data []byte, conn net.Conn) erro
 	sb.WriteString(host)
 	sb.WriteString("\r\nX-Naive-Session: ")
 	sb.WriteString(sessionID)
-	sb.WriteString(fmt.Sprintf("\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n", len(data)))
+	if isFirst && target != "" {
+		sb.WriteString("\r\nX-Naive-Target: ")
+		sb.WriteString(target)
+	}
+	sb.WriteString(fmt.Sprintf("\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n", len(upData)))
 	if auth != "" {
 		sb.WriteString("Proxy-Authorization: ")
 		sb.WriteString(auth)
@@ -275,20 +250,37 @@ func doPost(host, path, auth, sessionID string, data []byte, conn net.Conn) erro
 	sb.WriteString("\r\n")
 
 	if _, err := io.WriteString(conn, sb.String()); err != nil {
-		return err
+		return nil, false, fmt.Errorf("write headers: %w", err)
 	}
-	if _, err := conn.Write(data); err != nil {
-		return err
+	if len(upData) > 0 {
+		if _, err := conn.Write(upData); err != nil {
+			return nil, false, fmt.Errorf("write body: %w", err)
+		}
 	}
 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return err
+		return nil, false, fmt.Errorf("read response: %w", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("upstream POST returned %d", resp.StatusCode)
+	defer resp.Body.Close()
+
+	log.Printf("[tunnel] POST %d up → %d", len(upData), resp.StatusCode)
+
+	sessionClosed := resp.Header.Get("X-Naive-Closed") == "1"
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, false, fmt.Errorf("read downstream: %w", err)
+		}
+		return data, sessionClosed, nil
+	case http.StatusNoContent:
+		return nil, sessionClosed, nil
+	case http.StatusGone:
+		return nil, true, nil
+	default:
+		return nil, true, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	return nil
 }
