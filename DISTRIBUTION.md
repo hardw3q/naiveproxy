@@ -1,8 +1,8 @@
-# NaiveCDN Binary Distribution via GitLab
+# NaiveCDN Binary Distribution via Sonatype Nexus
 
-Централизованное автообновление бинарника `naivecdn` через GitLab CI/CD,
-Generic Package Registry и Release API — для Android SDK, Tauri (Win/macOS)
-и NuxtJS.
+Централизованное автообновление бинарника `naivecdn` через GitLab CI/CD
+и Sonatype Nexus Repository (Raw hosted) на `pypi.pixels-it.ru` —
+для Android SDK, Tauri (Win/macOS) и NuxtJS.
 
 ---
 
@@ -11,27 +11,61 @@ Generic Package Registry и Release API — для Android SDK, Tauri (Win/macOS
 ```
 gitlab.pixels-it.ru/pixelservices/pixelprotocol
 │
-├── .gitlab-ci.yml          ← билд-матрица по тегу vX.Y.Z
-│
-├── GitLab Package Registry ← артефакты всех платформ + version.json
-│   packages/generic/naivecdn/{version}/
-│       naivecdn-linux-arm64
-│       naivecdn-windows-amd64.exe
-│       naivecdn-darwin-amd64
-│       naivecdn-darwin-arm64
-│       version.json
-│
-└── GitLab Releases         ← human-readable changelog + те же ссылки
+└── .gitlab-ci.yml          ← билд-матрица по тегу vX.Y.Z
+        │
+        │  PUT (Basic Auth)
+        ▼
+pypi.pixels-it.ru  (Sonatype Nexus — Raw hosted repo "naivecdn")
+    repository/naivecdn/
+        {version}/
+            naivecdn-linux-arm64
+            naivecdn-linux-arm64.sha256
+            naivecdn-windows-amd64.exe
+            naivecdn-windows-amd64.exe.sha256
+            naivecdn-darwin-amd64
+            naivecdn-darwin-amd64.sha256
+            naivecdn-darwin-arm64
+            naivecdn-darwin-arm64.sha256
+            version.json
+        latest/
+            version.json     ← всегда указывает на последний релиз
 ```
 
 Клиенты (Android / Tauri / NuxtJS) при старте:
-1. Запрашивают `version.json` → сравнивают с локальной версией.
-2. Если есть обновление → скачивают платформенный бинарник.
-3. Проверяют SHA-256 → заменяют → перезапускают процесс.
+1. Запрашивают `https://pypi.pixels-it.ru/repository/naivecdn/latest/version.json`
+2. Сравнивают `version` с локальной → если новее, скачивают бинарник
+3. Проверяют SHA-256 → заменяют → перезапускают процесс
 
 ---
 
-## 1. GitLab CI/CD Pipeline
+## 1. Настройка Sonatype Nexus
+
+### Создание Raw hosted репозитория
+
+В веб-интерфейсе Nexus (`https://pypi.pixels-it.ru`):
+
+```
+Administration → Repositories → Create repository → raw (hosted)
+  Name:          naivecdn
+  Deployment:    Allow redeploy   ← разрешить перезапись latest/
+  Blob store:    default
+```
+
+### Учётные данные для CI
+
+В GitLab (`Settings → CI/CD → Variables`) добавить:
+
+| Variable | Value | Protected | Masked |
+|---|---|---|---|
+| `NEXUS_USER` | deploy-user | ✓ | — |
+| `NEXUS_PASSWORD` | ••••• | ✓ | ✓ |
+
+Пользователь Nexus должен иметь роль `nx-repository-view-raw-naivecdn-*`
+(или `nx-admin` для простоты).
+
+---
+
+## 2. GitLab CI/CD Pipeline
 
 ### `.gitlab-ci.yml`
 
@@ -42,16 +76,13 @@ stages:
 
 variables:
   GO_VERSION: "1.22"
-  PACKAGE_NAME: "naivecdn"
-  REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}"
+  NEXUS_RAW: "https://pypi.pixels-it.ru/repository/naivecdn"
 
-# Матрица платформ
 .build_template: &build_template
   stage: build
   image: golang:${GO_VERSION}
   before_script:
     - apt-get update -qq && apt-get install -y -qq curl
-    # Зеркало модулей недоступно — берём из кеша или вендора
     - cd go && go mod download 2>/dev/null || true
   artifacts:
     paths:
@@ -106,7 +137,7 @@ publish:
   stage: publish
   image: curlimages/curl:latest
   only:
-    - tags   # только при пуше тега vX.Y.Z
+    - tags    # только при пуше тега vX.Y.Z
   needs:
     - build:linux-arm64
     - build:windows-amd64
@@ -114,13 +145,15 @@ publish:
     - build:darwin-arm64
   script:
     - VERSION=${CI_COMMIT_TAG}
-    - BASE="${REGISTRY_URL}/${VERSION}"
-    # Загружаем бинарники
+    - VERSIONED="${NEXUS_RAW}/${VERSION}"
+    # Загружаем бинарники и sha256-файлы в Nexus
     - |
       for f in dist/*; do
-        name=$(basename $f)
-        curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-             --upload-file "$f" "${BASE}/${name}"
+        name=$(basename "$f")
+        curl --fail --silent \
+             -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+             --upload-file "$f" \
+             "${VERSIONED}/${name}"
       done
     # Генерируем version.json
     - |
@@ -129,31 +162,33 @@ publish:
         "version": "${VERSION}",
         "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
         "binaries": {
-          "linux-arm64":    { "url": "${BASE}/naivecdn-linux-arm64",       "sha256": "$(cat dist/naivecdn-linux-arm64.sha256)" },
-          "windows-amd64":  { "url": "${BASE}/naivecdn-windows-amd64.exe", "sha256": "$(cat dist/naivecdn-windows-amd64.exe.sha256)" },
-          "darwin-amd64":   { "url": "${BASE}/naivecdn-darwin-amd64",      "sha256": "$(cat dist/naivecdn-darwin-amd64.sha256)" },
-          "darwin-arm64":   { "url": "${BASE}/naivecdn-darwin-arm64",      "sha256": "$(cat dist/naivecdn-darwin-arm64.sha256)" }
+          "linux-arm64":   { "url": "${VERSIONED}/naivecdn-linux-arm64",       "sha256": "$(cat dist/naivecdn-linux-arm64.sha256)" },
+          "windows-amd64": { "url": "${VERSIONED}/naivecdn-windows-amd64.exe", "sha256": "$(cat dist/naivecdn-windows-amd64.exe.sha256)" },
+          "darwin-amd64":  { "url": "${VERSIONED}/naivecdn-darwin-amd64",      "sha256": "$(cat dist/naivecdn-darwin-amd64.sha256)" },
+          "darwin-arm64":  { "url": "${VERSIONED}/naivecdn-darwin-arm64",      "sha256": "$(cat dist/naivecdn-darwin-arm64.sha256)" }
         }
       }
       EOF
-    - curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-           --upload-file dist/version.json "${BASE}/version.json"
-    # Также кладём как "latest"
-    - curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-           --upload-file dist/version.json "${REGISTRY_URL}/latest/version.json"
-    # Создаём GitLab Release
+    # Кладём version.json рядом с версионными бинарниками
+    - curl --fail --silent -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+           --upload-file dist/version.json "${VERSIONED}/version.json"
+    # Перезаписываем latest/ (Allow redeploy включён в репо)
+    - curl --fail --silent -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+           --upload-file dist/version.json "${NEXUS_RAW}/latest/version.json"
+    # Создаём GitLab Release со ссылками на Nexus
     - |
-      curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+      curl --fail --silent \
+           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
            --header "Content-Type: application/json" \
            --data "{
              \"name\": \"NaiveCDN ${VERSION}\",
              \"tag_name\": \"${VERSION}\",
              \"description\": \"Auto-release ${VERSION}\",
              \"assets\": { \"links\": [
-               {\"name\": \"linux-arm64\",   \"url\": \"${BASE}/naivecdn-linux-arm64\"},
-               {\"name\": \"windows-amd64\", \"url\": \"${BASE}/naivecdn-windows-amd64.exe\"},
-               {\"name\": \"darwin-amd64\",  \"url\": \"${BASE}/naivecdn-darwin-amd64\"},
-               {\"name\": \"darwin-arm64\",  \"url\": \"${BASE}/naivecdn-darwin-arm64\"}
+               {\"name\": \"linux-arm64\",   \"url\": \"${VERSIONED}/naivecdn-linux-arm64\"},
+               {\"name\": \"windows-amd64\", \"url\": \"${VERSIONED}/naivecdn-windows-amd64.exe\"},
+               {\"name\": \"darwin-amd64\",  \"url\": \"${VERSIONED}/naivecdn-darwin-amd64\"},
+               {\"name\": \"darwin-arm64\",  \"url\": \"${VERSIONED}/naivecdn-darwin-arm64\"}
              ]}
            }" \
            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
@@ -163,12 +198,7 @@ publish:
 
 ---
 
-## 2. Android SDK
-
-### Подход
-
-Бинарник запускается как дочерний процесс (как в Wireguard/Shadowsocks Go
-сборках). Внешний процесс изолирует VPN-логику от основного потока JVM.
+## 3. Android SDK
 
 ### `NaiveCdnUpdater.kt`
 
@@ -184,7 +214,7 @@ import java.security.MessageDigest
 object NaiveCdnUpdater {
 
     private const val VERSION_URL =
-        "https://gitlab.pixels-it.ru/api/v4/projects/<PROJECT_ID>/packages/generic/naivecdn/latest/version.json"
+        "https://pypi.pixels-it.ru/repository/naivecdn/latest/version.json"
     private const val PLATFORM = "linux-arm64"   // Android ARM64
 
     suspend fun checkAndUpdate(ctx: Context): Boolean = withContext(Dispatchers.IO) {
@@ -251,7 +281,6 @@ class NaiveCdnProcess(private val ctx: Context) {
             .redirectErrorStream(true)
             .start()
 
-        // Логи в logcat
         Thread {
             process?.inputStream?.bufferedReader()?.forEachLine { android.util.Log.d("NaiveCDN", it) }
         }.start()
@@ -266,7 +295,7 @@ class NaiveCdnProcess(private val ctx: Context) {
 }
 ```
 
-### `Application.onCreate` (точка входа)
+### `Application.onCreate`
 
 ```kotlin
 class App : Application() {
@@ -279,33 +308,25 @@ class App : Application() {
 }
 ```
 
-### `AndroidManifest.xml` — разрешения
+### `AndroidManifest.xml`
 
 ```xml
 <uses-permission android:name="android.permission.INTERNET" />
 <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 ```
 
-### VPN bypass (если используется VpnService)
+### VPN bypass
 
 ```kotlin
-// Перед установкой туннеля защитить сокет бинарника:
-// (передаётся через Unix socket или ioctl из бинарника)
 vpnService.protect(socket.fd)
-// или добавить bypass-маршрут через Builder:
+// или маршрут bypass для IP сервера:
 vpnBuilder.addRoute("0.0.0.0", 0)
-vpnBuilder.excludeRoute("151.236.112.29", 32) // IP CDN-сервера
+vpnBuilder.excludeRoute("151.236.112.29", 32)
 ```
 
 ---
 
-## 3. Tauri (Windows / macOS)
-
-### Подход
-
-Tauri поддерживает sidecar-бинарники (команда `tauri.conf.json` →
-`bundle.externalBin`). Автообновление sidecar — через кастомный updater
-(встроенный updater обновляет только сам `.app`, не sidecar).
+## 4. Tauri (Windows / macOS)
 
 ### `src-tauri/src/updater.rs`
 
@@ -313,7 +334,7 @@ Tauri поддерживает sidecar-бинарники (команда `tauri
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{fs, io::Write, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -327,12 +348,12 @@ struct BinaryInfo {
     sha256: String,
 }
 
+const VERSION_URL: &str =
+    "https://pypi.pixels-it.ru/repository/naivecdn/latest/version.json";
+
 pub async fn check_and_update(sidecar_path: PathBuf, current_version: &str) -> anyhow::Result<bool> {
     let client = Client::new();
-    let manifest: Manifest = client
-        .get("https://gitlab.pixels-it.ru/api/v4/projects/<PROJECT_ID>/packages/generic/naivecdn/latest/version.json")
-        .send().await?
-        .json().await?;
+    let manifest: Manifest = client.get(VERSION_URL).send().await?.json().await?;
 
     if manifest.version == current_version {
         return Ok(false);
@@ -343,10 +364,10 @@ pub async fn check_and_update(sidecar_path: PathBuf, current_version: &str) -> a
     #[cfg(target_os = "windows")]
     let platform = "windows-amd64";
 
-    let info = manifest.binaries.get(platform).ok_or(anyhow::anyhow!("no binary for platform"))?;
+    let info = manifest.binaries.get(platform)
+        .ok_or_else(|| anyhow::anyhow!("no binary for platform"))?;
     let bytes = client.get(&info.url).send().await?.bytes().await?;
 
-    // SHA-256 проверка
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let actual = format!("{:x}", hasher.finalize());
@@ -366,7 +387,7 @@ pub async fn check_and_update(sidecar_path: PathBuf, current_version: &str) -> a
 }
 ```
 
-### `tauri.conf.json` — регистрация sidecar
+### `tauri.conf.json`
 
 ```json
 {
@@ -378,10 +399,10 @@ pub async fn check_and_update(sidecar_path: PathBuf, current_version: &str) -> a
 }
 ```
 
-> Tauri ожидает файлы вида `binaries/naivecdn-x86_64-apple-darwin` и т.д.
+> Tauri ожидает файлы вида `binaries/naivecdn-x86_64-apple-darwin`.
 > Именование по Triple-target: `ARCH-VENDOR-OS`.
 
-### Вызов из Tauri команды
+### Вызов из команды
 
 ```rust
 #[tauri::command]
@@ -390,7 +411,6 @@ async fn start_proxy(app: tauri::AppHandle) -> Result<(), String> {
         .resolve_resource("binaries/naivecdn")
         .expect("binary not found");
 
-    // Обновить перед стартом
     let version = std::env::var("NAIVECDN_VERSION").unwrap_or_default();
     let _ = check_and_update(binary.clone(), &version).await;
 
@@ -405,21 +425,7 @@ async fn start_proxy(app: tauri::AppHandle) -> Result<(), String> {
 
 ---
 
-## 4. NuxtJS (десктоп/сервер)
-
-### Подход А — Nuxt как UI, бинарник на том же хосте (Electron-like / Tauri)
-
-Если NuxtJS работает внутри Tauri — используй раздел выше.
-
-### Подход Б — Nuxt SSR-сервер + naivecdn как sidecar процесс
-
-```
-┌──────────────────────────────┐
-│  Nuxt SSR (Node.js)          │
-│  server/plugins/naivecdn.ts  │──spawn──► naivecdn --config ...
-│  server/api/proxy-status.ts  │           SOCKS5 :1080
-└──────────────────────────────┘
-```
+## 5. NuxtJS (SSR-сервер)
 
 ### `server/plugins/naivecdn.ts`
 
@@ -430,7 +436,7 @@ import { join } from "path";
 import https from "https";
 
 const VERSION_URL =
-  "https://gitlab.pixels-it.ru/api/v4/projects/<PROJECT_ID>/packages/generic/naivecdn/latest/version.json";
+  "https://pypi.pixels-it.ru/repository/naivecdn/latest/version.json";
 
 let cdnProcess: ChildProcess | null = null;
 let currentVersion = "";
@@ -511,42 +517,45 @@ export default defineNuxtConfig({
 
 ---
 
-## 5. Сводная таблица
+## 6. Сводная таблица
 
-| Платформа        | Бинарник             | Механизм обновления         | Запуск           |
-|------------------|----------------------|-----------------------------|------------------|
-| Android ARM64    | `naivecdn-linux-arm64` | Kotlin coroutine + SHA-256  | `ProcessBuilder` |
-| macOS Intel      | `naivecdn-darwin-amd64` | Rust `reqwest` + SHA-256   | Tauri sidecar    |
-| macOS Apple      | `naivecdn-darwin-arm64` | Rust `reqwest` + SHA-256   | Tauri sidecar    |
-| Windows x64      | `naivecdn-windows-amd64.exe` | Rust `reqwest` + SHA-256 | Tauri sidecar  |
-| Linux/Server SSR | `naivecdn-linux-arm64` | Node.js `https` + chmod     | `child_process`  |
+| Платформа        | Бинарник                     | Механизм обновления       | Запуск           |
+|------------------|------------------------------|---------------------------|------------------|
+| Android ARM64    | `naivecdn-linux-arm64`       | Kotlin coroutine + SHA-256 | `ProcessBuilder` |
+| macOS Intel      | `naivecdn-darwin-amd64`      | Rust `reqwest` + SHA-256  | Tauri sidecar    |
+| macOS Apple      | `naivecdn-darwin-arm64`      | Rust `reqwest` + SHA-256  | Tauri sidecar    |
+| Windows x64      | `naivecdn-windows-amd64.exe` | Rust `reqwest` + SHA-256  | Tauri sidecar    |
+| Linux/Server SSR | `naivecdn-linux-arm64`       | Node.js `https` + chmod   | `child_process`  |
 
 ---
 
-## 6. Выпуск новой версии
+## 7. Выпуск новой версии
 
 ```bash
-# В репозитории pixelprotocol
 git tag v1.1.0
 git push gitlab v1.1.0
 ```
 
 GitLab CI автоматически:
 1. Кросс-компилирует все 4 платформы.
-2. Загружает бинарники в Package Registry.
-3. Обновляет `latest/version.json`.
-4. Создаёт GitLab Release.
+2. Загружает бинарники и `.sha256` в Nexus по пути `/{version}/`.
+3. Перезаписывает `latest/version.json` в Nexus.
+4. Создаёт GitLab Release со ссылками на Nexus.
 
 Клиенты при следующем старте увидят новую версию в `version.json` и
-скачают обновлённый бинарник.
+скачают обновлённый бинарник с `pypi.pixels-it.ru`.
 
 ---
 
-## 7. Безопасность
+## 8. Безопасность
 
-- **Токен скачивания**: Package Registry можно сделать публичным (без
-  токена) или выдать `Deploy Token` с правами `read_package_registry`.
-- **Подпись**: дополнительно можно подписывать бинарники GPG-ключом и
-  проверять подпись перед запуском.
-- **Pinning**: хранить минимальную версию в коде клиента — не
-  откатываться ниже неё даже если сервер отдаёт старый манифест.
+- **Публичный доступ на чтение**: в Nexus выдать анонимному пользователю
+  роль `nx-repository-view-raw-naivecdn-read` — клиентам не нужны учётные
+  данные для скачивания.
+- **Запись только из CI**: переменные `NEXUS_USER` / `NEXUS_PASSWORD`
+  помечены `Protected` в GitLab — недоступны в ветках, только в тегах.
+- **SHA-256**: клиенты проверяют контрольную сумму перед заменой бинарника.
+- **Pinning**: хранить минимальную допустимую версию в коде клиента —
+  не откатываться ниже неё.
+- **GPG-подпись** (опционально): подписывать бинарники в CI и
+  проверять подпись до запуска.
