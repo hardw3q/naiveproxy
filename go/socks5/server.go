@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 
@@ -68,7 +69,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		return
 	}
-	_ = tunnel.Stream(ctx, s.TunnelCfg, target, conn)
+	if err := tunnel.Stream(ctx, s.TunnelCfg, target, conn); err != nil {
+		log.Printf("[socks5] tunnel %s: %v", target, err)
+	}
 }
 
 // handshakeSocks5 performs the SOCKS5 handshake and returns the target "host:port".

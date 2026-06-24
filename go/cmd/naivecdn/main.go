@@ -29,10 +29,11 @@ import (
 )
 
 type Config struct {
-	Listen      string `json:"listen"`
-	Proxy       string `json:"proxy"`
-	TunnelPath  string `json:"tunnel_path"`
-	Fingerprint string `json:"fingerprint"`
+	Listen             string `json:"listen"`
+	Proxy              string `json:"proxy"`
+	TunnelPath         string `json:"tunnel_path"`
+	Fingerprint        string `json:"fingerprint"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
 }
 
 func main() {
@@ -67,9 +68,10 @@ func main() {
 	srv := &socks5.Server{
 		ListenAddr: listenAddr,
 		TunnelCfg: tunnel.Config{
-			ProxyURL:       cfg.Proxy,
-			TunnelPath:     cfg.TunnelPath,
-			TLSFingerprint: cfg.Fingerprint,
+			ProxyURL:           cfg.Proxy,
+			TunnelPath:         cfg.TunnelPath,
+			TLSFingerprint:     cfg.Fingerprint,
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
 		},
 	}
 
