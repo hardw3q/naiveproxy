@@ -38,6 +38,10 @@ type Config struct {
 	TunnelPath         string
 	TLSFingerprint     string
 	InsecureSkipVerify bool
+	// DNSServer overrides the system resolver (e.g. "77.88.8.8:53").
+	// Required on Android: pure-Go binaries default to [::1]:53 which is
+	// Android's DNS stub — not accessible to non-CGO processes.
+	DNSServer string
 }
 
 func newSessionID() string {
@@ -82,9 +86,23 @@ func makeHTTPClient(cfg Config) *http.Client {
 		helloID = utls.HelloChrome_Auto
 	}
 
+	// Build a dialer that uses an explicit DNS server when configured.
+	// Pure-Go binaries on Android fall back to [::1]:53 (Android's DNS stub)
+	// which is not accessible from non-CGO processes → "connection refused".
+	dialer := &net.Dialer{}
+	if cfg.DNSServer != "" {
+		dnsAddr := cfg.DNSServer
+		dialer.Resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "udp", dnsAddr)
+			},
+		}
+	}
+
 	transport := &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
-			rawConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", serverAddr)
+			rawConn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 			if err != nil {
 				return nil, fmt.Errorf("dial %s: %w", host, err)
 			}

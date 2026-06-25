@@ -34,6 +34,7 @@ type Config struct {
 	TunnelPath         string `json:"tunnel_path"`
 	Fingerprint        string `json:"fingerprint"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
+	DNSServer          string `json:"dns_server"`
 }
 
 func main() {
@@ -72,6 +73,7 @@ func main() {
 			TunnelPath:         cfg.TunnelPath,
 			TLSFingerprint:     cfg.Fingerprint,
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
+			DNSServer:          cfg.DNSServer,
 		},
 	}
 
